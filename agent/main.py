@@ -26,6 +26,10 @@ class Metrics(BaseModel):
     roi: str
     winRate: str
     maxDrawdown: str
+    sharpeRatio: str
+    profitFactor: str
+    totalTrades: str
+    feesPaid: str
 
 class EquityPoint(BaseModel):
     timestamp: str

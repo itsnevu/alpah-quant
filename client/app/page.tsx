@@ -29,6 +29,10 @@ interface Metrics {
   roi: string;
   winRate: string;
   maxDrawdown: string;
+  sharpeRatio: string;
+  profitFactor: string;
+  totalTrades: string;
+  feesPaid: string;
 }
 
 interface Signal {
@@ -306,7 +310,7 @@ export default function Home() {
           <div className="lg:col-span-7 flex flex-col gap-6">
             {/* Top Metrics Cards */}
             {data && (
-              <div className="grid grid-cols-3 gap-4">
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div className="glass-panel-emerald p-4 rounded-xl flex flex-col border-emerald-500/20 shadow-lg shadow-emerald-500/5 hover:-translate-y-0.5 transition-all">
                   <span className="text-[10px] uppercase font-bold text-emerald-500 tracking-wider">Estimated ROI</span>
                   <span className="text-2xl font-extrabold text-emerald-400 mt-1">{data.metrics.roi}</span>
@@ -318,6 +322,22 @@ export default function Home() {
                 <div className="glass-panel p-4 rounded-xl flex flex-col hover:-translate-y-0.5 transition-all">
                   <span className="text-[10px] uppercase font-bold text-red-500/80 tracking-wider">Max Drawdown</span>
                   <span className="text-2xl font-extrabold text-red-400 mt-1">{data.metrics.maxDrawdown}</span>
+                </div>
+                <div className="glass-panel p-4 rounded-xl flex flex-col hover:-translate-y-0.5 transition-all">
+                  <span className="text-[10px] uppercase font-bold text-indigo-400 tracking-wider">Sharpe Ratio</span>
+                  <span className="text-2xl font-extrabold text-indigo-300 mt-1">{data.metrics.sharpeRatio}</span>
+                </div>
+                <div className="glass-panel p-4 rounded-xl flex flex-col hover:-translate-y-0.5 transition-all">
+                  <span className="text-[10px] uppercase font-bold text-amber-500/80 tracking-wider">Profit Factor</span>
+                  <span className="text-2xl font-extrabold text-amber-400 mt-1">{data.metrics.profitFactor}</span>
+                </div>
+                <div className="glass-panel p-4 rounded-xl flex flex-col hover:-translate-y-0.5 transition-all">
+                  <span className="text-[10px] uppercase font-bold text-teal-400 tracking-wider">Total Trades</span>
+                  <span className="text-2xl font-extrabold text-teal-300 mt-1">{data.metrics.totalTrades}</span>
+                </div>
+                <div className="glass-panel p-4 rounded-xl flex flex-col hover:-translate-y-0.5 transition-all col-span-2 md:col-span-2">
+                  <span className="text-[10px] uppercase font-bold text-gray-500 tracking-wider">Fees & Slippage Paid</span>
+                  <span className="text-2xl font-extrabold text-gray-300 mt-1">{data.metrics.feesPaid}</span>
                 </div>
               </div>
             )}

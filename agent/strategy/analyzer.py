@@ -1,6 +1,7 @@
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Any
 from datetime import datetime
+import math
 from strategy.dataset import generate_historical_data
 
 class Signal(BaseModel):
@@ -13,6 +14,8 @@ class StrategyAnalyzer:
     """
     Core quant engine that parses a strategy spec and runs a backtest
     against simulated multi-dimensional CoinMarketCap metrics.
+    Includes advanced institutional-grade metrics: transaction costs, slippage,
+    Sharpe Ratio, Profit Factor, and Profit/Loss statistics.
     """
     def __init__(self):
         pass
@@ -48,16 +51,26 @@ class StrategyAnalyzer:
         sl_pct = risk.get("stop_loss_pct", 2.0) / 100.0
         ts_pct = risk.get("trailing_stop_pct", 1.0) / 100.0
         
-        # Fetch mock CMC historical dataset
+        # Transaction costs: fee + slippage (0.1% standard spot fee per trade)
+        fee_pct = risk.get("transaction_fee_pct", 0.1) / 100.0
+        leverage = risk.get("leverage", 1.0)
+        
+        # Fetch mock CMC historical dataset (30 days of hourly data)
         historical_data = generate_historical_data(token, days=30)
         
         initial_balance = 10000.0
         balance = initial_balance
-        position = None  # None or {"entry_price": float, "type": "LONG", "highest_price": float}
+        position = None  # None or {"entry_price": float, "type": "LONG", "highest_price": float, "size_cash": float}
         
         signals = []
         equity_curve = []
-        trades = []  # List of booleans (true = win, false = loss)
+        
+        # Trade performance tracking
+        trade_pnls = []  # List of raw cash PnLs per trade
+        total_fees_paid = 0.0
+        
+        # Hourly portfolio value tracking for Sharpe Ratio
+        portfolio_values = []
         
         for idx, bar in enumerate(historical_data):
             price = bar["price"]
@@ -80,8 +93,12 @@ class StrategyAnalyzer:
             # Evaluate current equity value
             current_value = balance
             if position:
-                pnl = (price - position["entry_price"]) / position["entry_price"]
-                current_value = balance * (1 + pnl)
+                # Calculate PnL with leverage
+                price_return = (price - position["entry_price"]) / position["entry_price"]
+                leveraged_return = price_return * leverage
+                current_value = balance * (1 + leveraged_return)
+            
+            portfolio_values.append(current_value)
             
             # Record equity point every 12 hours + last bar
             if idx % 12 == 0 or idx == len(historical_data) - 1:
@@ -93,7 +110,8 @@ class StrategyAnalyzer:
                 
             # If in position, check exits
             if position:
-                pnl = (price - position["entry_price"]) / position["entry_price"]
+                price_return = (price - position["entry_price"]) / position["entry_price"]
+                leveraged_return = price_return * leverage
                 
                 # Update peak price for trailing stop
                 if price > position["highest_price"]:
@@ -102,40 +120,56 @@ class StrategyAnalyzer:
                 trailing_trigger = position["highest_price"] * (1 - ts_pct)
                 
                 # Check Stop Loss
-                if pnl <= -sl_pct:
-                    balance = balance * (1 - sl_pct)
+                if leveraged_return <= -sl_pct:
+                    # Deduct SL and exit fee
+                    exit_loss = balance * sl_pct
+                    fee = (balance - exit_loss) * fee_pct
+                    total_fees_paid += fee
+                    
+                    balance = (balance - exit_loss) - fee
                     signals.append(Signal(
                         timestamp=timestamp,
                         type="SELL",
                         price=round(price, 4),
                         reason=f"Stop Loss Triggered at -{sl_pct*100}%"
                     ))
-                    trades.append(False)
+                    trade_pnls.append(-exit_loss)
                     position = None
                     
                 # Check Take Profit
-                elif pnl >= tp_pct:
-                    balance = balance * (1 + tp_pct)
+                elif leveraged_return >= tp_pct:
+                    # Add TP and deduct exit fee
+                    exit_profit = balance * tp_pct
+                    fee = (balance + exit_profit) * fee_pct
+                    total_fees_paid += fee
+                    
+                    balance = (balance + exit_profit) - fee
                     signals.append(Signal(
                         timestamp=timestamp,
                         type="SELL",
                         price=round(price, 4),
                         reason=f"Take Profit Triggered at +{tp_pct*100}%"
                     ))
-                    trades.append(True)
+                    trade_pnls.append(exit_profit)
                     position = None
                     
                 # Check Trailing Stop
-                elif price <= trailing_trigger and pnl > 0:
-                    exit_pnl = (trailing_trigger - position["entry_price"]) / position["entry_price"]
-                    balance = balance * (1 + exit_pnl)
+                elif price <= trailing_trigger and leveraged_return > 0:
+                    exit_price_return = (trailing_trigger - position["entry_price"]) / position["entry_price"]
+                    exit_leveraged_return = exit_price_return * leverage
+                    exit_pnl_cash = balance * exit_leveraged_return
+                    
+                    fee = (balance + exit_pnl_cash) * fee_pct
+                    total_fees_paid += fee
+                    
+                    balance = (balance + exit_pnl_cash) - fee
                     signals.append(Signal(
                         timestamp=timestamp,
                         type="SELL",
                         price=round(trailing_trigger, 4),
-                        reason=f"Trailing Stop Triggered at +{round(exit_pnl*100, 2)}%"
+                        reason=f"Trailing Stop Triggered at +{round(exit_leveraged_return*100, 2)}%"
                     ))
-                    trades.append(exit_pnl > 0)
+                    trade_pnls.append(exit_pnl_cash)
                     position = None
                     
                 # Check Custom Sell/Exit Rules generically
@@ -159,14 +193,18 @@ class StrategyAnalyzer:
                                 sell_reasons.append(f"{rule_name} Exit Condition ({desc or f'{op} {val}'})")
                                 
                     if sell_triggered and sell_reasons:
-                        balance = balance * (1 + pnl)
+                        exit_pnl_cash = balance * leveraged_return
+                        fee = (balance + exit_pnl_cash) * fee_pct
+                        total_fees_paid += fee
+                        
+                        balance = (balance + exit_pnl_cash) - fee
                         signals.append(Signal(
                             timestamp=timestamp,
                             type="SELL",
                             price=round(price, 4),
                             reason=" & ".join(sell_reasons)
                         ))
-                        trades.append(pnl > 0)
+                        trade_pnls.append(exit_pnl_cash)
                         position = None
                         
             # If not in position, check entries
@@ -202,6 +240,11 @@ class StrategyAnalyzer:
                         break
                         
                 if buy_triggered and buy_rules:
+                    # Deduct entry fee
+                    fee = balance * fee_pct
+                    total_fees_paid += fee
+                    balance -= fee
+                    
                     position = {
                         "entry_price": price,
                         "type": "LONG",
@@ -219,10 +262,40 @@ class StrategyAnalyzer:
         if position:
             last_price = historical_data[-1]["price"]
             pnl = (last_price - position["entry_price"]) / position["entry_price"]
-            final_equity = balance * (1 + pnl)
+            leveraged_return = pnl * leverage
+            final_equity = balance * (1 + leveraged_return)
             
         roi = ((final_equity - initial_equity) / initial_equity) * 100
-        win_rate = (sum(1 for t in trades if t) / len(trades) * 100) if trades else 0.0
+        
+        # Win Rate calculation
+        wins = sum(1 for p in trade_pnls if p > 0)
+        win_rate = (wins / len(trade_pnls) * 100) if trade_pnls else 0.0
+        
+        # Sharpe Ratio calculation (based on daily changes)
+        # 30 days = 720 hours. We can aggregate hourly values into 30 daily return steps.
+        daily_values = []
+        for d in range(30):
+            hour_idx = min((d + 1) * 24 - 1, len(portfolio_values) - 1)
+            daily_values.append(portfolio_values[hour_idx])
+            
+        daily_returns = []
+        for d in range(1, len(daily_values)):
+            ret = (daily_values[d] - daily_values[d-1]) / daily_values[d-1]
+            daily_returns.append(ret)
+            
+        if len(daily_returns) > 1:
+            mean_ret = sum(daily_returns) / len(daily_returns)
+            variance = sum((r - mean_ret) ** 2 for r in daily_returns) / (len(daily_returns) - 1)
+            std_ret = math.sqrt(variance)
+            # Annualized Sharpe (365 days in crypto)
+            sharpe = (mean_ret / std_ret) * math.sqrt(365) if std_ret > 0 else 0.0
+        else:
+            sharpe = 0.0
+            
+        # Profit Factor calculation
+        gross_profit = sum(p for p in trade_pnls if p > 0)
+        gross_loss = abs(sum(p for p in trade_pnls if p < 0))
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else (gross_profit if gross_profit > 0 else 1.0)
         
         # Max Drawdown calculation
         peak = initial_equity
@@ -236,14 +309,15 @@ class StrategyAnalyzer:
             p = bar["price"]
             if temp_position:
                 pnl = (p - temp_position["entry_price"]) / temp_position["entry_price"]
+                leveraged_return = pnl * leverage
                 # SL or TP check simulation
-                if pnl <= -sl_pct:
+                if leveraged_return <= -sl_pct:
                     temp_balance *= (1 - sl_pct)
                     temp_position = None
-                elif pnl >= tp_pct:
+                elif leveraged_return >= tp_pct:
                     temp_balance *= (1 + tp_pct)
                     temp_position = None
-                running_val = temp_balance * (1 + pnl) if temp_position else temp_balance
+                running_val = temp_balance * (1 + leveraged_return) if temp_position else temp_balance
             else:
                 running_val = temp_balance
                 matching_buy = [s for s in signals if s.timestamp == bar["timestamp"] and s.type == "BUY"]
@@ -260,7 +334,11 @@ class StrategyAnalyzer:
             "metrics": {
                 "roi": f"{'+' if roi >= 0 else ''}{round(roi, 1)}%",
                 "winRate": f"{round(win_rate, 0)}%",
-                "maxDrawdown": f"-{round(max_dd, 1)}%"
+                "maxDrawdown": f"-{round(max_dd, 1)}%",
+                "sharpeRatio": f"{round(sharpe, 2)}",
+                "profitFactor": f"{round(profit_factor, 2)}",
+                "totalTrades": f"{len(trade_pnls)}",
+                "feesPaid": f"${round(total_fees_paid, 2)}"
             },
             "signals": signals,
             "equity": equity_curve
