@@ -36,7 +36,7 @@ def generate_strategy_from_prompt(prompt: str) -> Dict:
     if openrouter_key:
         try:
             import requests
-            model = os.getenv("OPENROUTER_MODEL", "step/step-3-5")
+            model = os.getenv("OPENROUTER_MODEL", "stepfun/step-3.5-flash")
             url = "https://openrouter.ai/api/v1/chat/completions"
             headers = {
                 "Authorization": f"Bearer {openrouter_key}",
