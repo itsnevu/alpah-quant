@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from datetime import datetime
 from strategy.dataset import generate_historical_data
 
@@ -16,6 +16,27 @@ class StrategyAnalyzer:
     """
     def __init__(self):
         pass
+
+    def _eval_op(self, actual: float, op: str, threshold: float, ma_val: Optional[float] = None) -> bool:
+        """
+        Generic operator evaluator to handle various comparison types.
+        """
+        op = op.lower()
+        if op in ["greater_than", "gt", ">"]:
+            return actual > threshold
+        elif op in ["less_than", "lt", "<"]:
+            return actual < threshold
+        elif op in ["greater_than_or_equal", "gte", ">="]:
+            return actual >= threshold
+        elif op in ["less_than_or_equal", "lte", "<="]:
+            return actual <= threshold
+        elif op in ["equal_to", "eq", "=="]:
+            return actual == threshold
+        elif op == "greater_than_ma_multiplier" and ma_val is not None:
+            return actual > threshold * ma_val
+        elif op == "less_than_ma_multiplier" and ma_val is not None:
+            return actual < threshold * ma_val
+        return False
 
     def run_backtest(self, spec: Dict) -> Dict:
         token = spec.get("token", "BNB")
@@ -36,7 +57,7 @@ class StrategyAnalyzer:
         
         signals = []
         equity_curve = []
-        trades = []  # List of dicts to track win/loss
+        trades = []  # List of booleans (true = win, false = loss)
         
         for idx, bar in enumerate(historical_data):
             price = bar["price"]
@@ -47,15 +68,23 @@ class StrategyAnalyzer:
             whale = bar["whale_accumulation"]
             social = bar["social_heat"]
             
+            # Map indicator names to actual metrics for generic evaluation
+            metrics_map = {
+                "price": price,
+                "volume": volume,
+                "funding_rate": funding,
+                "whale_accumulation": whale,
+                "social_heat": social
+            }
+            
             # Evaluate current equity value
             current_value = balance
             if position:
                 pnl = (price - position["entry_price"]) / position["entry_price"]
                 current_value = balance * (1 + pnl)
             
-            # Record daily or interval equity point (let's do every 12 hours to keep data size reasonable)
+            # Record equity point every 12 hours + last bar
             if idx % 12 == 0 or idx == len(historical_data) - 1:
-                # Format to short date
                 date_str = timestamp.split("T")[0] + " " + timestamp.split("T")[1][:5]
                 equity_curve.append({
                     "timestamp": date_str,
@@ -74,7 +103,6 @@ class StrategyAnalyzer:
                 
                 # Check Stop Loss
                 if pnl <= -sl_pct:
-                    # SL Triggered
                     balance = balance * (1 - sl_pct)
                     signals.append(Signal(
                         timestamp=timestamp,
@@ -84,6 +112,7 @@ class StrategyAnalyzer:
                     ))
                     trades.append(False)
                     position = None
+                    
                 # Check Take Profit
                 elif pnl >= tp_pct:
                     balance = balance * (1 + tp_pct)
@@ -95,6 +124,7 @@ class StrategyAnalyzer:
                     ))
                     trades.append(True)
                     position = None
+                    
                 # Check Trailing Stop
                 elif price <= trailing_trigger and pnl > 0:
                     exit_pnl = (trailing_trigger - position["entry_price"]) / position["entry_price"]
@@ -107,38 +137,34 @@ class StrategyAnalyzer:
                     ))
                     trades.append(exit_pnl > 0)
                     position = None
-                # Check Sell Rules
+                    
+                # Check Custom Sell/Exit Rules generically
                 else:
                     sell_triggered = False
-                    sell_reason = ""
+                    sell_reasons = []
+                    
                     for rule in sell_rules:
-                        ind = rule["indicator"]
-                        op = rule["operator"]
-                        val = rule["value"]
+                        ind = rule.get("indicator")
+                        op = rule.get("operator")
+                        val = rule.get("value")
                         desc = rule.get("description", "")
                         
-                        if ind == "funding_rate":
-                            if op == "greater_than" and funding > val:
+                        if ind in metrics_map:
+                            actual_val = metrics_map[ind]
+                            ma_val = vol_ma if ind == "volume" else None
+                            
+                            if self._eval_op(actual_val, op, val, ma_val):
                                 sell_triggered = True
-                                sell_reason = f"Sell Rule: Funding {funding} > {val} ({desc})"
-                            elif op == "less_than" and funding < val:
-                                sell_triggered = True
-                                sell_reason = f"Sell Rule: Funding {funding} < {val} ({desc})"
-                        elif ind == "whale_accumulation":
-                            if op == "greater_than" and whale > val:
-                                sell_triggered = True
-                                sell_reason = f"Sell Rule: Whale Accumulation {whale} > {val} ({desc})"
-                            elif op == "less_than" and whale < val:
-                                sell_triggered = True
-                                sell_reason = f"Sell Rule: Whale Accumulation {whale} < {val} ({desc})"
+                                rule_name = ind.replace("_", " ").title()
+                                sell_reasons.append(f"{rule_name} Exit Condition ({desc or f'{op} {val}'})")
                                 
-                    if sell_triggered:
+                    if sell_triggered and sell_reasons:
                         balance = balance * (1 + pnl)
                         signals.append(Signal(
                             timestamp=timestamp,
                             type="SELL",
                             price=round(price, 4),
-                            reason=sell_reason
+                            reason=" & ".join(sell_reasons)
                         ))
                         trades.append(pnl > 0)
                         position = None
@@ -149,46 +175,28 @@ class StrategyAnalyzer:
                 buy_reasons = []
                 
                 for rule in buy_rules:
-                    ind = rule["indicator"]
-                    op = rule["operator"]
-                    val = rule["value"]
+                    ind = rule.get("indicator")
+                    op = rule.get("operator")
+                    val = rule.get("value")
                     desc = rule.get("description", "")
                     
                     rule_passed = False
-                    
-                    if ind == "volume":
-                        if op == "greater_than_ma_multiplier":
-                            if volume > val * vol_ma:
-                                rule_passed = True
+                    if ind in metrics_map:
+                        actual_val = metrics_map[ind]
+                        ma_val = vol_ma if ind == "volume" else None
+                        
+                        if self._eval_op(actual_val, op, val, ma_val):
+                            rule_passed = True
+                            rule_name = ind.replace("_", " ").title()
+                            
+                            # Beautify display reasons
+                            if ind == "volume" and op == "greater_than_ma_multiplier":
                                 buy_reasons.append(f"Volume spike ({round(volume/vol_ma, 1)}x MA)")
-                        elif op == "greater_than" and volume > val:
-                            rule_passed = True
-                            buy_reasons.append(f"Volume {volume} > {val}")
-                            
-                    elif ind == "funding_rate":
-                        if op == "less_than" and funding < val:
-                            rule_passed = True
-                            buy_reasons.append(f"Funding {funding} < {val}")
-                        elif op == "greater_than" and funding > val:
-                            rule_passed = True
-                            buy_reasons.append(f"Funding {funding} > {val}")
-                            
-                    elif ind == "whale_accumulation":
-                        if op == "greater_than" and whale > val:
-                            rule_passed = True
-                            buy_reasons.append(f"Whale flow {whale} > {val}")
-                        elif op == "less_than" and whale < val:
-                            rule_passed = True
-                            buy_reasons.append(f"Whale flow {whale} < {val}")
-                            
-                    elif ind == "social_heat":
-                        if op == "greater_than" and social > val:
-                            rule_passed = True
-                            buy_reasons.append(f"Social heat {social} > {val}")
-                        elif op == "less_than" and social < val:
-                            rule_passed = True
-                            buy_reasons.append(f"Social heat {social} < {val}")
-                            
+                            elif ind == "funding_rate":
+                                buy_reasons.append(f"Funding rate {actual_val} ({op} {val})")
+                            else:
+                                buy_reasons.append(f"{rule_name} matches ({desc or f'{op} {val}'})")
+                                
                     if not rule_passed:
                         buy_triggered = False
                         break
@@ -219,8 +227,6 @@ class StrategyAnalyzer:
         # Max Drawdown calculation
         peak = initial_equity
         max_dd = 0.0
-        running_equity = initial_equity
-        pos_entry_idx = None
         
         # Re-traverse equity steps to find max drawdown
         temp_balance = initial_equity
@@ -237,12 +243,9 @@ class StrategyAnalyzer:
                 elif pnl >= tp_pct:
                     temp_balance *= (1 + tp_pct)
                     temp_position = None
-                # Update peak for current trade
-                # Simple approximation
                 running_val = temp_balance * (1 + pnl) if temp_position else temp_balance
             else:
                 running_val = temp_balance
-                # Trigger entry check (simplified matching the signal logs)
                 matching_buy = [s for s in signals if s.timestamp == bar["timestamp"] and s.type == "BUY"]
                 if matching_buy:
                     temp_position = {"entry_price": p}
