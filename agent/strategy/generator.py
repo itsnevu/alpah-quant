@@ -6,45 +6,72 @@ from typing import Dict
 def generate_strategy_from_prompt(prompt: str) -> Dict:
     """
     Parses a natural language prompt into a structured, backtestable trading strategy spec.
-    First tries to use LLM via Gemini (if API key is present), otherwise falls back to a 
+    First tries to use OpenRouter (if API key is present) with Claude 3.5 Sonnet,
+    then Gemini (if API key is present), otherwise falls back to a 
     powerful semantic heuristic parser.
     """
+    system_instruction = (
+        "You are an expert quantitative trading developer. Parse the user's trading strategy prompt "
+        "into a JSON spec. You must ONLY output valid JSON. Do not write anything else. "
+        "Structure of JSON:\n"
+        "{\n"
+        "  \"token\": \"BNB\" | \"CAKE\" | \"TWT\" (default to BNB),\n"
+        "  \"name\": \"Name of strategy\",\n"
+        "  \"indicators_used\": [\"volume\", \"funding_rate\", \"whale_accumulation\", \"social_heat\"],\n"
+        "  \"buy_rules\": [\n"
+        "    { \"indicator\": \"indicator_name\", \"operator\": \"less_than\"|\"greater_than\", \"value\": float_value, \"description\": \"text description\" }\n"
+        "  ],\n"
+        "  \"sell_rules\": [\n"
+        "    { \"indicator\": \"indicator_name\", \"operator\": \"less_than\"|\"greater_than\", \"value\": float_value, \"description\": \"text description\" }\n"
+        "  ],\n"
+        "  \"risk_management\": {\n"
+        "    \"take_profit_pct\": float,\n"
+        "    \"stop_loss_pct\": float,\n"
+        "    \"trailing_stop_pct\": float\n"
+        "  }\n"
+        "}"
+    )
+
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
+    if openrouter_key:
+        try:
+            import requests
+            model = os.getenv("OPENROUTER_MODEL", "anthropic/claude-3.5-sonnet")
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {openrouter_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost:3000",
+                "X-Title": "AlphaQuant"
+            }
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "user", "content": f"{system_instruction}\n\nPrompt: {prompt}"}
+                ],
+                "response_format": { "type": "json_object" }
+            }
+            res = requests.post(url, headers=headers, json=payload, timeout=12)
+            if res.status_code == 200:
+                result_json = res.json()
+                text_out = result_json["choices"][0]["message"]["content"]
+                text_cleaned = re.sub(r"```json\s*", "", text_out)
+                text_cleaned = re.sub(r"```\s*$", "", text_cleaned).strip()
+                return json.loads(text_cleaned)
+        except Exception as e:
+            print(f"OpenRouter API call failed, trying Gemini: {e}")
+
     api_key = os.getenv("GEMINI_API_KEY")
     if api_key:
         try:
-            # We could call Gemini using a simple requests call to keep things light 
-            # and avoid heavy dependencies
             import requests
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={api_key}"
             headers = {"Content-Type": "application/json"}
-            system_instruction = (
-                "You are an expert quantitative trading developer. Parse the user's trading strategy prompt "
-                "into a JSON spec. You must ONLY output valid JSON. Do not write anything else. "
-                "Structure of JSON:\n"
-                "{\n"
-                "  \"token\": \"BNB\" | \"CAKE\" | \"TWT\" (default to BNB),\n"
-                "  \"name\": \"Name of strategy\",\n"
-                "  \"indicators_used\": [\"volume\", \"funding_rate\", \"whale_accumulation\", \"social_heat\"],\n"
-                "  \"buy_rules\": [\n"
-                "    { \"indicator\": \"indicator_name\", \"operator\": \"less_than\"|\"greater_than\", \"value\": float_value, \"description\": \"text description\" }\n"
-                "  ],\n"
-                "  \"sell_rules\": [\n"
-                "    { \"indicator\": \"indicator_name\", \"operator\": \"less_than\"|\"greater_than\", \"value\": float_value, \"description\": \"text description\" }\n"
-                "  ],\n"
-                "  \"risk_management\": {\n"
-                "    \"take_profit_pct\": float,\n"
-                "    \"stop_loss_pct\": float,\n"
-                "    \"trailing_stop_pct\": float\n"
-                "  }\n"
-                "}"
-            )
-            
             payload = {
                 "contents": [
                     {"role": "user", "parts": [{"text": f"{system_instruction}\n\nPrompt: {prompt}"}]}
                 ]
             }
-            
             res = requests.post(url, headers=headers, json=payload, timeout=10)
             if res.status_code == 200:
                 result_json = res.json()
